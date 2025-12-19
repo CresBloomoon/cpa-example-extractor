@@ -1,153 +1,340 @@
-import json
-from dataclasses import asdict, is_dataclass
-from typing import Dict
+from __future__ import annotations
 
-import fitz
+import io
+from dataclasses import asdict, is_dataclass
+from typing import Dict, List, Tuple
+
 import pandas as pd
 import streamlit as st
 
-from cpa_tool.config import SUBJECT_CODES, SUBJECT_LABELS, SUBJECT_LABEL_OPTIONS, LABEL_TO_CODE
-from cpa_tool.subject_detect import detect_subject_from_doc
-from cpa_tool.extract import extract_examples
-from cpa_tool.utils import sort_df
-from cpa_tool.checks import count_none_cells
-from cpa_tool.outputs import build_zip
+# ====== cpa_tool imports（環境差異に強くする）======
+try:
+    # 例題抽出本体
+    from cpa_tool.extract import extract_examples
+except Exception:
+    extract_examples = None  # type: ignore
+
+try:
+    # zip生成（科目別xlsxをzipにまとめる）
+    from cpa_tool.outputs import build_zip
+except Exception:
+    build_zip = None  # type: ignore
+
+# 科目判定（あれば使う、なければ簡易）
+try:
+    from cpa_tool.subject_detect import detect_subject_scores  # (pdf_bytes, filename) -> dict
+except Exception:
+    detect_subject_scores = None  # type: ignore
 
 
-st.set_page_config(page_title="CPA 例題抽出（科目自動判定→科目別出力）", layout="wide")
-st.title("CPAテキスト 例題抽出ツール（科目自動判定 → 不明のみ手修正 → 科目別xlsx）")
+# ====== 表示用ラベル ======
+SUBJECT_LABEL = {
+    "zeimu": "租税法",
+    "zaimu": "財務会計",
+    "kanri": "管理会計",
+    "unknown": "不明",
+}
+
+SUBJECT_OPTIONS = ["zeimu", "zaimu", "kanri"]
+
+
+# ====== 科目ごとの「表示列」設定 ======
+SUBJECT_COLUMNS = {
+    # 租税法：章節は必要（例）
+    "zeimu": [
+        "subject",
+        "chapter_no", "chapter_title",
+        "section_no", "section_title",
+        "example_no", "title",
+        "rank",              # 租税法が論文のみなら rank でOK（今の実装に合わせる）
+        "page_ref",
+        "pdf_page",
+        "source_pdf",
+    ],
+    # 財務：短答/論文/交換など
+    "zaimu": [
+        "subject",
+        "chapter_no", "chapter_title",
+        "section_no", "section_title",
+        "example_no", "title",
+        "rank_tanto", "rank_ronbun", "rank_koukan",
+        "page_ref",
+        "pdf_page",
+        "source_pdf",
+    ],
+    # 管理：章節いらない運用なら最小にする
+    "kanri": [
+        "subject",
+        "example_no", "title",
+        "rank_tanto", "rank_ronbun",
+        "page_ref",
+        "pdf_page",
+        "source_pdf",
+    ],
+}
+
+
+# ====== ユーティリティ ======
+def _safe_to_dict(x) -> dict:
+    """dataclass / dict / pydanticっぽい / その他をdict化"""
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return x
+    if is_dataclass(x):
+        return asdict(x)
+    # pydantic v1/v2
+    if hasattr(x, "model_dump"):
+        return x.model_dump()
+    if hasattr(x, "dict"):
+        return x.dict()
+    # 最後の手段
+    try:
+        return dict(x)
+    except Exception:
+        return {"value": str(x)}
+
+
+def _simple_subject_score_from_filename(filename: str) -> Dict[str, int]:
+    """subject_detectが無い場合の超簡易スコア（ファイル名ヒント）"""
+    name = (filename or "").lower()
+    score = {"zeimu": 0, "zaimu": 0, "kanri": 0}
+
+    # ありがちな単語を雑に加点
+    if "租税" in filename or "法人税" in filename or "所得税" in filename or "消費税" in filename:
+        score["zeimu"] += 50
+    if "財務" in filename or "会計" in filename or "計算" in filename:
+        score["zaimu"] += 50
+    if "管理" in filename or "原価" in filename or "意思決定" in filename:
+        score["kanri"] += 50
+
+    # さらに微調整
+    if "kanri" in name:
+        score["kanri"] += 10
+    if "zaimu" in name:
+        score["zaimu"] += 10
+    if "zeimu" in name or "zei" in name or "tax" in name:
+        score["zeimu"] += 10
+
+    return score
+
+
+def detect_subject_for_file(pdf_bytes: bytes, filename: str) -> Tuple[str, Dict[str, int]]:
+    """科目自動判定：cpa_toolがあればそれ、なければファイル名ヒント"""
+    if detect_subject_scores is not None:
+        try:
+            scores_raw = detect_subject_scores(pdf_bytes, filename)  # type: ignore
+            # detect_subject_scoresは"zei"形式で返すが、内部では"zeimu"にマッピング
+            # ここでは"zeimu"形式に変換
+            scores = {
+                "zeimu": scores_raw.get("zei", 0),
+                "zaimu": scores_raw.get("zaimu", 0),
+                "kanri": scores_raw.get("kanri", 0),
+            }
+        except Exception:
+            scores = _simple_subject_score_from_filename(filename)
+    else:
+        scores = _simple_subject_score_from_filename(filename)
+
+    best = max(scores.items(), key=lambda kv: kv[1])[0] if scores else "unknown"
+    return best, scores
+
+
+def render_final_check_by_subject(df_all: pd.DataFrame) -> pd.DataFrame:
+    """
+    編集（最終チェック）を科目別expanderで表示し、編集結果を結合して返す。
+    """
+    if df_all is None or df_all.empty:
+        st.info("抽出結果がありません。")
+        return df_all
+
+    if "subject" not in df_all.columns:
+        st.warning("subject列がないため、科目別表示できません。")
+        return df_all
+
+    st.subheader("編集（最終チェック）")
+
+    edited_chunks = []
+
+    # 表示順
+    order = ["zeimu", "zaimu", "kanri", "unknown"]
+    subjects = [s for s in order if s in set(df_all["subject"].astype(str))]
+    subjects += [s for s in sorted(set(df_all["subject"].astype(str))) if s not in subjects]
+
+    for subj in subjects:
+        df_sub = df_all[df_all["subject"].astype(str) == subj].copy()
+        label = SUBJECT_LABEL.get(subj, subj)
+
+        cols = SUBJECT_COLUMNS.get(subj, list(df_sub.columns))
+        cols = [c for c in cols if c in df_sub.columns]  # 存在しない列は落とす
+
+        with st.expander(f"{label}（{len(df_sub)}件）", expanded=False):
+            df_view = df_sub[cols].copy()
+
+            edited = st.data_editor(
+                df_view,
+                use_container_width=True,
+                hide_index=True,
+                key=f"final_check_{subj}",  # ★科目ごとにユニーク
+            )
+
+            # 表示列だけ差し戻し
+            for c in edited.columns:
+                df_sub.loc[:, c] = edited[c].values
+
+        edited_chunks.append(df_sub)
+
+    out = pd.concat(edited_chunks, axis=0).sort_index()
+    return out
+
+
+# ====== UI ======
+st.set_page_config(page_title="CPAテキスト 例題抽出ツール", layout="wide")
+st.title("CPAテキスト 例題抽出ツール（科目自動判定→不明のみ手修正→科目別xlsx）")
 
 uploaded_files = st.file_uploader(
     "PDFをドラッグ＆ドロップ（複数OK）",
     type=["pdf"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
 )
 
-if uploaded_files:
-    # 1) 科目判定（軽い）
-    file_rows = []
-    file_bytes_map: Dict[str, bytes] = {}
+if not uploaded_files:
+    st.stop()
 
-    with st.spinner("科目判定中…（ファイル名も加点）"):
-        for uf in uploaded_files:
-            b = uf.read()
-            file_bytes_map[uf.name] = b
+st.success(f"アップロード：{len(uploaded_files)}ファイル")
 
-            doc = fitz.open(stream=b, filetype="pdf")
-            subj_code, scores = detect_subject_from_doc(doc, uf.name)
-            doc.close()
+# ====== 科目判定結果 ======
+rows = []
+file_bytes_map: Dict[str, bytes] = {}
 
-            file_rows.append({
-                "file_name": uf.name,
-                "detected_subject": SUBJECT_LABELS[subj_code],
-                "score_租税": scores.get("zeimu", 0),
-                "score_財務": scores.get("zaimu", 0),
-                "score_管理": scores.get("kanri", 0),
-                "final_subject": SUBJECT_LABELS[subj_code],
-            })
+for f in uploaded_files:
+    b = f.read()
+    file_bytes_map[f.name] = b
 
-    st.success(f"アップロード：{len(uploaded_files)} ファイル")
-    file_df = pd.DataFrame(file_rows)
+    detected, scores = detect_subject_for_file(b, f.name)
+    row = {
+        "file_name": f.name,
+        "detected_subject": SUBJECT_LABEL.get(detected, detected),
+        "score_租税": scores.get("zeimu", 0),
+        "score_財務": scores.get("zaimu", 0),
+        "score_管理": scores.get("kanri", 0),
+        "final_subject": SUBJECT_LABEL.get(detected, detected),
+        "_final_subject_code": detected,
+    }
+    rows.append(row)
 
-    st.subheader("科目判定結果（不明だけ直せばOK）")
-    with st.form("subject_form", clear_on_submit=False):
-        edited_file_df = st.data_editor(
-            file_df,
-            use_container_width=True,
-            num_rows="fixed",
-            column_config={
-                "final_subject": st.column_config.SelectboxColumn(
-                    "final_subject",
-                    options=SUBJECT_LABEL_OPTIONS
-                ),
-                "detected_subject": st.column_config.TextColumn("detected_subject", disabled=True),
-                "file_name": st.column_config.TextColumn("file_name", disabled=True),
-                "score_租税": st.column_config.NumberColumn("score_租税", disabled=True),
-                "score_財務": st.column_config.NumberColumn("score_財務", disabled=True),
-                "score_管理": st.column_config.NumberColumn("score_管理", disabled=True),
-            },
-            key="subject_editor"
+df_subj = pd.DataFrame(rows)
+
+st.subheader("科目判定結果（不明だけ直せばOK）")
+
+# ユーザが編集できる列（final_subjectだけ）
+# 表示は日本語、内部はコードに戻す
+label_to_code = {v: k for k, v in SUBJECT_LABEL.items()}
+code_to_label = {k: v for k, v in SUBJECT_LABEL.items()}
+
+# final_subject の選択肢（日本語）
+final_choices = [SUBJECT_LABEL[c] for c in SUBJECT_OPTIONS]
+
+# data_editor用：表示列
+df_view = df_subj[["file_name", "detected_subject", "score_租税", "score_財務", "score_管理", "final_subject"]].copy()
+
+edited = st.data_editor(
+    df_view,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "final_subject": st.column_config.SelectboxColumn(
+            "final_subject",
+            help="科目が違うならここだけ直してOK",
+            options=final_choices,
         )
-        run_extract = st.form_submit_button("解析実行（ここで抽出スタート）")
+    },
+    key="subject_table",
+)
 
-    # 2) 抽出（重い）
-    if run_extract:
-        all_items = []
-        with st.spinner("例題抽出中…（少し待ってね）"):
-            for _, r in edited_file_df.iterrows():
-                fname = r["file_name"]
-                subj_label = r["final_subject"]
-                subj_code = LABEL_TO_CODE.get(subj_label, "unknown")
+# 編集結果をコードに戻す
+final_code_map = {}
+for i, r in edited.iterrows():
+    fname = r["file_name"]
+    subj_label = r["final_subject"]
+    subj_code = label_to_code.get(subj_label, "unknown")
+    final_code_map[fname] = subj_code
 
-                b = file_bytes_map[fname]
-                items = extract_examples(b, subj_code, fname)
-                all_items.extend([x if isinstance(x, dict) else asdict(x) for x in items])
+# ====== 実行 ======
+st.divider()
+run = st.button("解析実行（ここで抽出スタート）", type="primary", disabled=False)
 
-        if not all_items:
-            st.warning("例題が抽出できませんでした。例題の表記ゆれがあるかも。")
-            st.stop()
+if not run:
+    st.stop()
 
-        base_df = sort_df(pd.DataFrame(all_items))
-        st.session_state["edited_df"] = base_df.copy()
+if extract_examples is None:
+    st.error("cpa_tool.extract.extract_examples が見つかりません。cpa_tool の実装を確認してね。")
+    st.stop()
 
-    # 3) 編集 → チェック → 出力
-    if "edited_df" in st.session_state:
-        st.divider()
-        st.subheader("編集（最終チェック）")
+# unknownファイルを事前に警告
+unknown_files = [fname for fname, subj_code in final_code_map.items() if subj_code not in SUBJECT_OPTIONS]
+if unknown_files:
+    for fname in unknown_files:
+        st.warning(f"科目が不明のためスキップ: {fname}")
 
-        with st.form("edit_form", clear_on_submit=False):
-            edited_df = st.data_editor(
-                st.session_state["edited_df"],
-                use_container_width=True,
-                num_rows="fixed",
-                column_config={
-                    "rank": st.column_config.SelectboxColumn("rank(互換)", options=[None, "A", "B", "C"]),
-                    "rank_tanto": st.column_config.SelectboxColumn("rank_短答", options=[None, "A", "B", "C"]),
-                    "rank_ronbun": st.column_config.SelectboxColumn("rank_論文", options=[None, "A", "B", "C"]),
-                    "title": st.column_config.TextColumn("title"),
-                    "page_ref": st.column_config.TextColumn("page_ref"),
-                    "source_pdf": st.column_config.TextColumn("source_pdf", disabled=True),
-                },
-                key="main_editor"
-            )
-            update_check = st.form_submit_button("チェック更新（ここで集計）")
+# 処理対象ファイルをフィルタリング（unknownを除外）
+valid_files = [(fname, subj_code) for fname, subj_code in final_code_map.items() if subj_code in SUBJECT_OPTIONS]
+total_files = len(valid_files)
 
-        if update_check:
-            st.session_state["edited_df"] = sort_df(edited_df)
+if total_files == 0:
+    st.warning("処理対象のファイルがありません。科目が不明のファイルはスキップされます。")
+    st.stop()
 
-        current_df = st.session_state["edited_df"]
+# ローディングリングとステータス表示
+all_items: List[dict] = []
+with st.spinner("🔍 解析処理を実行中..."):
+    for idx, (fname, subj_code) in enumerate(valid_files, 1):
+        b = file_bytes_map[fname]
+        items = extract_examples(b, subj_code, fname)  # 既存のシグネチャに合わせる（pdf_bytes, subject_code, source_pdf）
+        # itemsがdataclassでもdictでもOKにする
+        all_items.extend([_safe_to_dict(x) for x in items])
 
-        st.subheader("チェック結果（現在）")
-        total_none, per_col = count_none_cells(current_df)
-        st.metric("全セルの未入力（None）件数", f"{total_none} 個")
+st.success(f"✅ 処理完了: {total_files}ファイル、{len(all_items)}件の例題を抽出しました")
 
-        st.caption("列別の未入力（None）件数")
-        per_col_df = (
-            pd.DataFrame([{"column": k, "none_count": int(v)} for k, v in per_col.items()])
-            .sort_values("none_count", ascending=False)
-            .reset_index(drop=True)
-        )
-        st.dataframe(per_col_df, use_container_width=True)
+if not all_items:
+    st.warning("例題が抽出できませんでした。例題の表記ゆれがあるかも。")
+    st.stop()
 
-        if total_none == 0:
-            st.success("🎉 未入力はありません。出力してOKです。")
+df_all = pd.DataFrame(all_items)
 
-        st.divider()
-        st.subheader("最終出力")
+# ====== 編集（最終チェック）科目別 ======
+df_all = render_final_check_by_subject(df_all)
 
-        per_subject = {s: current_df[current_df["subject"] == s].copy() for s in SUBJECT_CODES}
-        zip_buf = build_zip(per_subject)
+# ここで「チェック更新（ここで集計）」ボタンを置くなら、df_all確定後にやる
+st.button("チェック更新（ここで集計）", key="refresh_dummy")
 
-        st.download_button(
-            "科目別ZIPをダウンロード（xlsx + json）",
-            data=zip_buf,
-            file_name="CPA_examples_by_subject.zip",
-            mime="application/zip"
-        )
+# ====== 出力 ======
+st.subheader("チェック結果（現在）")
+st.dataframe(df_all, use_container_width=True, hide_index=True)
 
-        st.download_button(
-            "ALL_examples.json（まとめ）をダウンロード",
-            data=json.dumps(sort_df(current_df).to_dict(orient="records"), ensure_ascii=False, indent=2),
-            file_name="ALL_examples.json",
-            mime="application/json"
-        )
+st.divider()
+st.subheader("最終出力")
+
+# 科目別に分けてzip出力
+per_subject: Dict[str, pd.DataFrame] = {}
+for subj in SUBJECT_OPTIONS:
+    d = df_all[df_all.get("subject", "").astype(str) == subj].copy()
+    if not d.empty:
+        per_subject[subj] = d
+
+if not per_subject:
+    st.warning("科目別に分けられませんでした（subject列を確認してね）。")
+    st.stop()
+
+if build_zip is None:
+    st.error("cpa_tool.outputs.build_zip が見つかりません。cpa_tool の実装を確認してね。")
+    st.stop()
+
+zip_buf: io.BytesIO = build_zip(per_subject)  # type: ignore
+
+st.download_button(
+    label="科目別xlsx（zip）をダウンロード",
+    data=zip_buf.getvalue(),
+    file_name="cpa_examples_by_subject.zip",
+    mime="application/zip",
+)

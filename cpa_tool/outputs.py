@@ -1,38 +1,40 @@
-from io import BytesIO
-import json
+# cpa_tool/outputs.py
+from __future__ import annotations
+
+import io
 import zipfile
 from typing import Dict
 
 import pandas as pd
 
-from .config import SUBJECT_LABELS
 from .excel_export import build_excel
-from .utils import sort_df
 
 
-def build_zip(per_subject_dfs: Dict[str, pd.DataFrame]) -> BytesIO:
-    zip_buf = BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for subj in ["zeimu", "zaimu", "kanri"]:
-            df = per_subject_dfs.get(subj)
-            if df is None or df.empty:
-                continue
+def build_zip(per_subject: Dict[str, pd.DataFrame]) -> io.BytesIO:
+    """
+    per_subject:
+      {
+        "zaimu": df_zaimu,
+        "kanri": df_kanri,
+        "zeimu": df_zeimu,
+      }
+    """
+    zbuf = io.BytesIO()
 
-            label = SUBJECT_LABELS[subj]
+    with zipfile.ZipFile(zbuf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        any_written = False
+
+        for subj, df in (per_subject or {}).items():
+            # dfがNoneでも build_excel が安全に1枚残すのでOK
             xlsx_buf = build_excel(df, subj)
-            zf.writestr(f"{label}_examples.xlsx", xlsx_buf.getvalue())
 
-            j = json.dumps(df.to_dict(orient="records"), ensure_ascii=False, indent=2)
-            zf.writestr(f"{label}_examples.json", j)
+            filename = f"{subj}.xlsx"
+            zf.writestr(filename, xlsx_buf.getvalue())
+            any_written = True
 
-        unk = per_subject_dfs.get("unknown")
-        if unk is not None and not unk.empty:
-            j = json.dumps(unk.to_dict(orient="records"), ensure_ascii=False, indent=2)
-            zf.writestr("不明_examples.json", j)
+        # もし何も無かったら、zipが空で分かりづらいのでメモだけ入れる
+        if not any_written:
+            zf.writestr("README.txt", "No output. per_subject was empty.")
 
-        all_df = pd.concat([d for d in per_subject_dfs.values() if d is not None], ignore_index=True)
-        all_df = sort_df(all_df)
-        zf.writestr("ALL_examples.json", json.dumps(all_df.to_dict(orient="records"), ensure_ascii=False, indent=2))
-
-    zip_buf.seek(0)
-    return zip_buf
+    zbuf.seek(0)
+    return zbuf

@@ -1,9 +1,11 @@
 import re
 import io
-from typing import Optional
+from typing import List, Optional
 
 import fitz  # PyMuPDF
 import pdfplumber
+
+from ..models import ExampleItem
 
 
 # =========================
@@ -183,8 +185,8 @@ def extract_page_ref(page: pdfplumber.page.Page):
 class ZaimuExtractor:
     subject = "zaimu"
 
-    def extract(self, pdf_bytes: bytes, subject_code: str, source_pdf: str):
-        results = []
+    def extract(self, pdf_bytes: bytes, subject_code: str, source_pdf: str) -> List[ExampleItem]:
+        results: List[ExampleItem] = []
 
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         chapters = _parse_outline(doc)
@@ -215,20 +217,22 @@ class ZaimuExtractor:
 
                     rank_t, rank_r = _extract_ranks(b)
 
-                    results.append({
-                        "subject": "zaimu",
-                        "chapter_no": chap["no"],
-                        "chapter_title": chap["title"],
-                        "section_no": sec["no"],
-                        "section_title": sec["title"],
-                        "example_no": ex_no,
-                        "title": title,
-                        "rank_tantou": rank_t,
-                        "rank_ronbun": rank_r,
-                        "rank_koukan": rank_r,
-                        "page_ref": page_ref,
-                        "pdf_page": pdf_page,
-                        "source_pdf": source_pdf,
-                    })
+                    results.append(
+                        ExampleItem(
+                            subject=subject_code,
+                            chapter_no=chap["no"],
+                            chapter_title=chap["title"],
+                            section_no=sec["no"],
+                            section_title=sec["title"],
+                            example_no=ex_no,
+                            title=title,
+                            rank=rank_r,  # 互換用：論文ランクを設定
+                            rank_tanto=rank_t,
+                            rank_ronbun=rank_r,
+                            page_ref=page_ref,
+                            pdf_page=pdf_page,
+                            source_pdf=source_pdf,
+                        )
+                    )
 
         return results

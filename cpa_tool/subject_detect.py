@@ -28,7 +28,7 @@ FILENAME_HINTS: Dict[str, Dict[str, int]] = {
 }
 
 #ファイル名は人間が答えを書いてくれているので重みを高くする
-FILENAME_WEIGHT = 1.8
+FILENAME_WEIGHT = 3.0
 
 
 def _score_text(text: str, weights: Dict[str, Dict[str, int]], base_factor: float = 1.0) -> Dict[str, int]:
@@ -78,3 +78,27 @@ def detect_subject_from_doc(doc: fitz.Document, file_name: str) -> Tuple[str, Di
         return "unknown", scores
 
     return best, scores
+
+
+def detect_subject_scores(pdf_bytes: bytes, filename: str) -> Dict[str, int]:
+    """
+    PDFバイト列とファイル名から科目スコアを計算する
+    app.pyとのインターフェース用（科目コードは"zei"/"zaimu"/"kanri"形式で返す）
+    注意: app.pyでは"zeimu"形式に統一されているため、この関数は"zei"形式で返すが、
+    detect_subject_for_file内で"zeimu"に変換される
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        _, scores_raw = detect_subject_from_doc(doc, filename)
+        doc.close()
+        
+        # "zeimu" -> "zei" にマッピング（app.pyとの互換性のため）
+        scores = {
+            "zei": scores_raw.get("zeimu", 0),
+            "zaimu": scores_raw.get("zaimu", 0),
+            "kanri": scores_raw.get("kanri", 0),
+        }
+        return scores
+    except Exception:
+        # エラー時は空のスコアを返す
+        return {"zei": 0, "zaimu": 0, "kanri": 0}
