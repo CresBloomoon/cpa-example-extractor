@@ -1,6 +1,6 @@
 import re
 import io
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import pdfplumber
@@ -42,9 +42,12 @@ RANK_IN_TITLE_RE = re.compile(
 def clean_title(title: str) -> str:
     """
     例題タイトルから「短答:A 論文:C」等を除去
+    また、冒頭の「-1」「-2」のような例題番号も除去
     """
     t = _norm(title)
     t = RANK_IN_TITLE_RE.sub("", t)
+    # タイトル冒頭の「-数字」や「-数字 」（ハイフン + 数字）を削除
+    t = re.sub(r"^[\-－]\s*\d+\s+", "", t)
     t = re.sub(r"\s{2,}", " ", t)
     return t.strip()
 
@@ -112,16 +115,99 @@ def _find_chapter_section(chapters, page):
 
 
 # =========================
-# 財務：例題抽出
+# 財務：目次からの抽出
+# =========================
+
+# 章タイトル抽出用の正規表現
+# 例: "【第1章 現金預金】"
+_CHAPTER_HEADER_RE = re.compile(
+    r"[【[]\s*第\s*(?P<chapter_no>\d+)\s*章\s*(?P<chapter_title>[^】\]]+?)[】\]]"
+)
+
+# 目次行（例題目次）
+# 例: "1 A C 現金過不足① ①-6"
+# または: "1 Ａ Ｃ 現金過不足① ①-6"
+# 形式: 例題番号 短答 論文 題目 テキスト参照
+_TOC_LINE_RE = re.compile(
+    r"^(?P<ex_no>\d+)\s+"
+    r"(?P<rank_t>[ABCＡＢＣ])\s+"
+    r"(?P<rank_r>[ABCＡＢＣ])\s+"
+    r"(?P<title>.+?)\s+"
+    r"(?P<page_ref>[①-⑩]\s*[-－]\s*\d+)",
+    re.MULTILINE
+)
+
+
+def _extract_toc_map(pdf: pdfplumber.PDF, max_pages: int = 40) -> Tuple[Dict[str, Dict], Dict[int, str]]:
+    """
+    例題目次が前半にある前提で、最初の max_pages くらいから辞書を作る。
+    key は "章番号-例題番号" の形式（例: "1-1", "2-3"）。
+    
+    Returns:
+        (toc_dict, chapter_title_map): 例題情報の辞書と、章番号→章タイトルのマッピング
+    """
+    toc: Dict[str, Dict] = {}
+    chapter_title_map: Dict[int, str] = {}
+    current_chapter = 0
+
+    for i in range(min(max_pages, len(pdf.pages))):
+        text = pdf.pages[i].extract_text() or ""
+        if not text:
+            continue
+
+        for line in text.splitlines():
+            line_orig = line.strip()
+            
+            # 章ヘッダーの検索
+            chapter_match = _CHAPTER_HEADER_RE.search(line_orig)
+            if chapter_match:
+                current_chapter = int(chapter_match.group("chapter_no"))
+                chapter_title = chapter_match.group("chapter_title").strip()
+                chapter_title = re.sub(r"\s+", " ", chapter_title).strip()
+                if chapter_title:
+                    chapter_title_map[current_chapter] = chapter_title
+                continue
+            
+            # 例題行の検索（正規化前のテキストで）
+            m = _TOC_LINE_RE.search(line_orig)
+            if not m:
+                continue
+            
+            if current_chapter == 0:
+                continue  # 章が特定できていない場合はスキップ
+
+            ex_no = int(m.group("ex_no"))
+            ex_key = f"{current_chapter}-{ex_no}"
+            
+            rank_t = _clean_rank(m.group("rank_t"))
+            rank_r = _clean_rank(m.group("rank_r"))
+            
+            # ページ参照の正規化
+            page_ref_raw = m.group("page_ref")
+            page_ref = _norm(page_ref_raw).replace(" ", "")
+            
+            title = _norm(m.group("title")).strip()
+            
+            toc[ex_key] = {
+                "chapter_no": current_chapter,
+                "example_no": ex_no,
+                "rank_tanto": rank_t,
+                "rank_ronbun": rank_r,
+                "page_ref": page_ref,
+                "title": title,
+            }
+
+    return toc, chapter_title_map
+
+
+# =========================
+# 財務：本文からの例題抽出
 # =========================
 
 EX_HEADER_RE = re.compile(
     r"(?:^|\n)\s*例題\s*(\d+)\s*([^\n]{1,80})",
     re.MULTILINE
 )
-
-RANK_TANTO_RE = re.compile(r"(?:短答|短)\s*[: ]\s*([ABCＡ-Ｃ])")
-RANK_RONBUN_RE = re.compile(r"(?:論文|論)\s*[: ]\s*([ABCＡ-Ｃ])")
 
 
 def _split_blocks(text: str):
@@ -132,16 +218,6 @@ def _split_blocks(text: str):
         e = hits[i + 1].start() if i + 1 < len(hits) else len(text)
         blocks.append(text[s:e])
     return blocks
-
-
-def _extract_ranks(block: str):
-    t = _norm(block)
-    m1 = RANK_TANTO_RE.search(t)
-    m2 = RANK_RONBUN_RE.search(t)
-    return (
-        _clean_rank(m1.group(1)) if m1 else None,
-        _clean_rank(m2.group(1)) if m2 else None,
-    )
 
 
 # =========================
@@ -193,6 +269,9 @@ class ZaimuExtractor:
         doc.close()
 
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            # 目次からランク情報を取得
+            toc_map, chapter_title_map = _extract_toc_map(pdf, max_pages=40)
+
             for i, page in enumerate(pdf.pages):
                 pdf_page = i + 1
                 page_ref = extract_page_ref(page)
@@ -206,22 +285,44 @@ class ZaimuExtractor:
                 chap = chap or {"no": 0, "title": ""}
                 sec = sec or {"no": 0, "title": ""}
 
+                # 章タイトルは目次から優先的に取得
+                chapter_title = chapter_title_map.get(chap["no"], chap["title"])
+
                 for b in blocks:
                     m = EX_HEADER_RE.search(b)
                     if not m:
                         continue
 
-                    ex_no = int(m.group(1))
+                    # 本文から抽出した例題番号（目次がない場合のフォールバック用）
+                    ex_no_from_text = int(m.group(1))
                     raw_title = m.group(2).strip()
                     title = clean_title(raw_title)
 
-                    rank_t, rank_r = _extract_ranks(b)
+                    # 目次から情報を取得（例題番号、ランク、page_refなど）
+                    # まず、本文から抽出した例題番号で検索を試みる
+                    ex_key = f"{chap['no']}-{ex_no_from_text}"
+                    toc_info = toc_map.get(ex_key, {})
+                    
+                    # 目次から例題番号を取得（あればそれを使用）
+                    ex_no = toc_info.get("example_no", ex_no_from_text)
+                    rank_t = toc_info.get("rank_tanto")
+                    rank_r = toc_info.get("rank_ronbun")
+                    
+                    # 目次にpage_refがある場合はそれを使用
+                    toc_page_ref = toc_info.get("page_ref")
+                    if toc_page_ref:
+                        page_ref = toc_page_ref
+                    
+                    # 目次からタイトルを取得（あればそれを使用、より正確な可能性がある）
+                    toc_title = toc_info.get("title")
+                    if toc_title:
+                        title = toc_title
 
                     results.append(
                         ExampleItem(
                             subject=subject_code,
                             chapter_no=chap["no"],
-                            chapter_title=chap["title"],
+                            chapter_title=chapter_title,
                             section_no=sec["no"],
                             section_title=sec["title"],
                             example_no=ex_no,
